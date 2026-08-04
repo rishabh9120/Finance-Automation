@@ -7,8 +7,9 @@ def init_db():
     if not os.path.exists(DB_FILE):
         # Create empty dataframes with our target schema
         df_transactions = pd.DataFrame(columns=[
-            'date', 'description', 'amount', 'type', 
-            'account_source', 'category', 'is_reviewed'
+            'date', 'description', 'amount', 'type',
+            'account_source', 'category', 'is_reviewed',
+            'you_paid', 'you_received', 'match_notes', '_dup_seq'
         ])
         df_rules = pd.DataFrame(columns=['keyword', 'category'])
         

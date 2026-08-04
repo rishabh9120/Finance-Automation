@@ -123,49 +123,80 @@ def standardize_hdfc_excel(df):
 
 def standardize_splitwise_data(df, user_name="Rishabh Agrawal"):
     """
-    Converts the Splitwise net balance matrix into 'you_paid' and 'your_share' columns.
+    Converts the Splitwise net balance matrix into standardized transaction rows.
+
+    Three kinds of money movement come out of a Splitwise export, and they
+    need to be treated differently:
+      - A group bill you fronted -> 'you_paid' (matched to a bank Debit)
+      - A settlement paid back to you -> 'you_received' (matched to a bank Credit)
+      - Your real personal share of an expense -> 'your_share' / 'Amount'
+    Settlements ("Payment" rows) are never a real expense (bug #2 fix) -- they're
+    just cash moving between people and must not inflate category spend.
     """
     if user_name not in df.columns:
         raise ValueError(f"User '{user_name}' not found in Splitwise columns. Please check your exact Splitwise display name.")
-        
+
+    df = df.copy()
+
+    # --- bug #1 fix: drop Splitwise's own running-balance summary row and any
+    # blank/footer rows before doing any arithmetic on them. ---
+    df['Description'] = df['Description'].astype(str).str.strip()
+    df = df[df['Description'].str.lower() != 'total balance']
+    df = df[df['Category'].notna() & (df['Category'].astype(str).str.strip() != '')]
+    df = df[df['Date'].notna()]
+
     df['Cost'] = pd.to_numeric(df['Cost'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-    
-    you_paid = []
-    your_share = []
-    
+
+    you_paid, your_share, you_received, txn_type, settlement_category = [], [], [], [], []
+
     for _, row in df.iterrows():
         cost = row['Cost']
         net = row[user_name]
-        
-        if pd.isna(net) or net == 0:
-            paid = 0
-            share = 0
-        elif net > 0:
-            # You paid the bill, you are owed the difference
-            paid = cost
-            share = cost - net
-        elif net < 0:
-            # Someone else paid, you owe them this amount
-            paid = 0
-            share = abs(net)
-            
+        if pd.isna(net):
+            net = 0
+        is_settlement = str(row['Category']).strip().lower() == 'payment'
+
+        if is_settlement:
+            # bug #2 fix: settlements move cash, they are not an expense.
+            paid = cost if net > 0 else 0.0       # you paid a roommate back
+            received = cost if net < 0 else 0.0   # a roommate paid you back
+            share = 0.0
+            ttype = 'Settlement'
+            cat = 'Settlement'
+        else:
+            received = 0.0
+            if net == 0:
+                paid, share = 0.0, 0.0
+            elif net > 0:
+                # You paid the bill, you are owed the difference
+                paid, share = cost, cost - net
+            else:
+                # Someone else paid, you owe them this amount
+                paid, share = 0.0, abs(net)
+            ttype = 'Debit'
+            cat = None  # keep the group-level default category chosen at upload
+
         you_paid.append(paid)
         your_share.append(share)
-        
+        you_received.append(received)
+        txn_type.append(ttype)
+        settlement_category.append(cat)
+
     df['you_paid'] = you_paid
     df['your_share'] = your_share
-    
-    # FIX: For Splitwise records, the 'Amount' column must be the true expense share.
-    # However, if you paid the bill, the engine needs 'you_paid' to match the bank.
-    # We set Amount to your true share, but keep 'you_paid' strictly for the matching engine.
-    df['Amount'] = your_share 
-    df['Type'] = 'Debit'
+    df['you_received'] = you_received
+    df['Type'] = txn_type
+    df['_settlement_category'] = settlement_category  # None unless it's a settlement row
+
+    # 'Amount' is always your true personal expense share -- 0 for settlements.
+    df['Amount'] = your_share
     df['Account_Source'] = 'Splitwise'
     df['Match_Notes'] = ""
-    
-    # We only care about rows where you had an expense OR you paid the group bill
-    df = df[(df['Amount'] > 0) | (df['you_paid'] > 0)].copy()
-    
+
+    # Keep: real personal expenses, bills you fronted, or settlements -- all three
+    # need to either show up in Analysis or be matched against the bank leg.
+    df = df[(df['Amount'] > 0) | (df['you_paid'] > 0) | (df['you_received'] > 0)].copy()
+
     return df
 # --- STREAMLIT UI ---
 
@@ -235,7 +266,10 @@ with tab_upload:
                         raw_sw_df = pd.read_csv(sw_file)
                         clean_sw = standardize_splitwise_data(raw_sw_df)
                         clean_sw = clean_sw.rename(columns={"Cost": "Total Cost", "Date": "Date"})
-                        clean_sw['Category'] = sw_categories[sw_file.name]
+                        # Settlement rows keep 'Settlement' as their category (bug #2);
+                        # every other row gets the group's chosen default category.
+                        clean_sw['Category'] = clean_sw['_settlement_category'].fillna(sw_categories[sw_file.name])
+                        clean_sw = clean_sw.drop(columns=['_settlement_category'])
                         new_dfs.append(clean_sw)
                 
                 if not new_dfs:
@@ -249,17 +283,36 @@ with tab_upload:
                 # Ensure safety columns exist
                 if 'category' not in new_data.columns: new_data['category'] = 'Uncategorized'
                 if 'you_paid' not in new_data.columns: new_data['you_paid'] = 0.0
+                if 'you_received' not in new_data.columns: new_data['you_received'] = 0.0
                 if 'match_notes' not in new_data.columns: new_data['match_notes'] = ""
-                
+
+                # bug #8 fix: a plain (date, description, amount, account) key collapses
+                # two *genuinely different* same-day transactions with identical text/amount
+                # (e.g. two ₹121 "Auto" rides) into one. Tag each row with its occurrence
+                # index within its own upload batch — computed BEFORE merging/sorting, so a
+                # re-upload of the same file reproduces the same indices and still dedupes
+                # correctly, while distinct look-alike rows keep their own identity.
+                DEDUP_COLUMNS = ['date', 'description', 'amount', 'account_source']
+
+                def _ensure_dup_seq(frame):
+                    frame = frame.copy()
+                    if '_dup_seq' not in frame.columns or frame['_dup_seq'].isna().any():
+                        frame['_dup_seq'] = frame.groupby(DEDUP_COLUMNS).cumcount()
+                    else:
+                        frame['_dup_seq'] = frame['_dup_seq'].astype(int)
+                    return frame
+
+                new_data = _ensure_dup_seq(new_data)
+
                 # 4. Merge with Existing Database
                 existing_df = pd.read_excel(DB_FILE, sheet_name='transactions')
                 if not existing_df.empty:
+                    existing_df = _ensure_dup_seq(existing_df)
                     combined_df = pd.concat([existing_df, new_data], ignore_index=True)
                     combined_df = combined_df.sort_values(by='is_reviewed', ascending=False)
-                    
+
                     # Deduplicate BEFORE matching (ignoring 'type' so we don't duplicate items that changed to Transfer)
-                    dedup_columns = ['date', 'description', 'amount', 'account_source']
-                    combined_df = combined_df.drop_duplicates(subset=dedup_columns, keep='first')
+                    combined_df = combined_df.drop_duplicates(subset=DEDUP_COLUMNS + ['_dup_seq'], keep='first')
                 else:
                     combined_df = new_data
                     
@@ -287,11 +340,13 @@ with tab_triage:
     # 1. Ensure columns exist
     if 'match_notes' not in df.columns: df['match_notes'] = ""
     if 'you_paid' not in df.columns: df['you_paid'] = 0.0
+    if 'you_received' not in df.columns: df['you_received'] = 0.0
     if 'your_share' not in df.columns: df['your_share'] = df['amount']
         
     # 2. FIX: Convert Excel 'NaN' blanks back into standard empty strings and zeros
     df['match_notes'] = df['match_notes'].fillna("")
     df['you_paid'] = df['you_paid'].fillna(0.0)
+    df['you_received'] = df['you_received'].fillna(0.0)
     df['your_share'] = df['your_share'].fillna(df['amount'])
         
     unreviewed_mask = df['is_reviewed'] == False
@@ -300,7 +355,7 @@ with tab_triage:
     if not unreviewed_df.empty:
         st.write("Confirm Categories and Auto-detected Transfers:")
         
-        display_cols = ['date', 'description', 'amount', 'you_paid', 'your_share', 'account_source', 'is_reviewed', 'category', 'type', 'match_notes']
+        display_cols = ['date', 'description', 'amount', 'you_paid', 'you_received', 'your_share', 'account_source', 'is_reviewed', 'category', 'type', 'match_notes']
         ui_df = unreviewed_df[display_cols]
         
       
@@ -311,17 +366,18 @@ with tab_triage:
                 "description": st.column_config.TextColumn("Description", disabled=True),
                 "amount": st.column_config.NumberColumn("Amount", format="₹%.2f", disabled=True),
                 "you_paid": st.column_config.NumberColumn("You Paid (Bank Match)", format="₹%.2f", disabled=True),
+                "you_received": st.column_config.NumberColumn("You Received (Bank Match)", format="₹%.2f", disabled=True),
                 "your_share": st.column_config.NumberColumn("Your True Expense", format="₹%.2f", disabled=True),
                 "account_source": st.column_config.TextColumn("Source", disabled=True),
                 "is_reviewed": st.column_config.CheckboxColumn("Reviewed ✅", default=False),
                 "category": st.column_config.SelectboxColumn(
                     "Category", 
                     # Updated options list:
-                    options=["Groceries", "Eating Out", "Party", "Transport", "Utilities", "Shopping", "Home Setup", "Travel - Weekend", "Travel - Major", "Rent", "General", "Demat Transfer", "Excluded", "Uncategorized"]
+                    options=["Groceries", "Eating Out", "Party", "Transport", "Utilities", "Shopping", "Home Setup", "Travel - Weekend", "Travel - Major", "Rent", "General", "Demat Transfer", "Settlement", "Excluded", "Uncategorized"]
                 ),
                 "type": st.column_config.SelectboxColumn(
                     "Type", 
-                    options=["Debit", "Credit", "Transfer", "Transfer_Splitwise_Base"]
+                    options=["Debit", "Credit", "Transfer", "Transfer_Splitwise_Base", "Transfer_Splitwise_Settlement", "Settlement"]
                 ),
                 "match_notes": st.column_config.TextColumn("Match Info (Audit)", disabled=True)
             },
@@ -396,6 +452,56 @@ with tab_triage:
     else:
         st.info("No unmatched transactions available for manual linking.")
 
+    # ==========================================
+    # --- MANUAL MATCHER TOOL: SETTLEMENTS RECEIVED (bug #6 counterpart) ---
+    # ==========================================
+    st.divider()
+    st.subheader("🔗 Manual Matcher — Settlements received")
+    st.write("Link a roommate's Splitwise repayment with the incoming Bank credit that the auto-engine missed.")
+
+    unmatched_bank_credit = df[(df['account_source'].isin(['HDFC Bank', 'SBI Bank', 'Bank'])) & (df['type'] == 'Credit') & (df['match_notes'] == '')]
+    unmatched_sw_received = df[(df['account_source'] == 'Splitwise') & (df['you_received'] > 0) & (df['match_notes'] == '')]
+
+    if not unmatched_bank_credit.empty and not unmatched_sw_received.empty:
+        col_r1, col_r2 = st.columns(2)
+
+        with col_r1:
+            credit_opts = unmatched_bank_credit.apply(
+                lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['description']} | ₹{r['amount']}", axis=1
+            ).tolist()
+            selected_credit_str = st.selectbox("Select Unmatched Bank Credit", ["-- Select --"] + credit_opts, key="credit_select")
+
+        with col_r2:
+            sw_recv_opts = unmatched_sw_received.apply(
+                lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['description']} | Received: ₹{r['you_received']}", axis=1
+            ).tolist()
+            selected_sw_recv_str = st.selectbox("Select Unmatched Splitwise Settlement", ["-- Select --"] + sw_recv_opts, key="sw_recv_select")
+
+        if st.button("Manually Link Settlement"):
+            if selected_credit_str != "-- Select --" and selected_sw_recv_str != "-- Select --":
+                import re
+
+                c_idx = int(re.search(r'\[(\d+)\]', selected_credit_str).group(1))
+                s_idx = int(re.search(r'\[(\d+)\]', selected_sw_recv_str).group(1))
+
+                df.at[c_idx, 'type'] = 'Transfer_Splitwise_Settlement'
+                df.at[c_idx, 'category'] = 'Excluded'
+                df.at[c_idx, 'match_notes'] = f"🔗 Matched SW: {df.at[s_idx, 'description']}"
+
+                df.at[s_idx, 'match_notes'] = f"🔗 Matched Bank: {df.at[c_idx, 'description']}"
+
+                rules_df = pd.read_excel(DB_FILE, sheet_name='category_rules')
+                with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
+                    df.to_excel(writer, sheet_name='transactions', index=False)
+                    rules_df.to_excel(writer, sheet_name='category_rules', index=False)
+
+                st.success("✅ Successfully linked settlement!")
+                st.rerun()
+            else:
+                st.warning("Please select both a Bank credit and a Splitwise settlement to link them.")
+    else:
+        st.info("No unmatched settlements available for manual linking.")
+
 with tab_analysis:
     st.header("Expense Analysis")
     
@@ -405,6 +511,7 @@ with tab_analysis:
         (df['is_reviewed'] == True) & 
         (df['type'] == 'Debit') & 
         (df['category'] != 'Excluded') & 
+        (df['category'] != 'Settlement') &
         (~df['category'].astype(str).str.contains('Transfer', case=False, na=False))
     ].copy()
     
