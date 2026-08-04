@@ -1,0 +1,12 @@
+# Finance tracker workbook
+finance_tracker.xlsx
+
+# Bank statement files
+Files/Bank Statements/*
+
+# Splitwise exports
+Files/Splitwise/*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
