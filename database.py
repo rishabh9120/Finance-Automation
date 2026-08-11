@@ -19,6 +19,8 @@ DEFAULT_CATEGORY_RULES = {
     "AJIO": "Shopping", "NYKAA": "Shopping",
     "ELECTRICITY": "Utilities", "BESCOM": "Utilities", "BROADBAND": "Utilities",
     "JIO FIBER": "Utilities", "JIOFIBER": "Utilities", "AIRTEL": "Utilities",
+    "CRUNCHYROLL": "Party", "BOOKMYSHOW": "Party", "BOOK MY SHOW": "Party", "NETFLIX": "Party",
+    "SPOTIFY": "Party", "HOTSTAR": "Party", "PRIME VIDEO": "Party",
 }
 
 

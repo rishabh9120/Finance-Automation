@@ -16,6 +16,7 @@ from logic import (
     SPLITWISE_CATEGORY_MAP,
     standardize_sbi_excel,
     standardize_hdfc_excel,
+    standardize_sbi_card_pdf,
     standardize_splitwise_data,
     finalize_splitwise_category,
     merge_and_dedup,
@@ -32,7 +33,7 @@ tab_upload, tab_triage, tab_analysis = st.tabs(["Upload & Sync", "Triage Queue",
 
 with tab_upload:
     st.header("Upload Statements")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         # Accept multiple bank files (Optional)
@@ -40,6 +41,15 @@ with tab_upload:
     with col2:
         # Accept multiple Splitwise files (Optional)
         sw_files = st.file_uploader("Upload Splitwise CSV(s) (Optional)", type=['csv'], accept_multiple_files=True)
+    with col3:
+        # Accept multiple credit card statement PDFs (Optional)
+        cc_files = st.file_uploader(
+            "Upload Credit Card Statement(s) (Optional)",
+            type=['pdf'], accept_multiple_files=True,
+            help="Currently supports SBI Card PDF statements. Itemized card transactions are imported directly; "
+                 "the corresponding bill payment in your bank statement is automatically excluded once matched, "
+                 "so it isn't counted as a second expense."
+        )
         
     # Dynamically create category dropdowns for Splitwise files BEFORE processing
     sw_categories = {}
@@ -58,8 +68,8 @@ with tab_upload:
         st.write("---")
         
     if st.button("Process Files"):
-        if not bank_files and not sw_files:
-            st.warning("⚠️ Please upload at least one Bank statement or Splitwise CSV to process.")
+        if not bank_files and not sw_files and not cc_files:
+            st.warning("⚠️ Please upload at least one Bank statement, Splitwise CSV, or Credit Card statement to process.")
         else:
             try:
                 new_dfs = []
@@ -114,7 +124,15 @@ with tab_upload:
                         clean_sw = clean_sw.rename(columns={"Cost": "Total Cost", "Date": "Date"})
                         clean_sw = finalize_splitwise_category(clean_sw, sw_categories[sw_file.name])
                         new_dfs.append(clean_sw)
-                
+
+                # 3. Standardize Credit Card Statements
+                if cc_files:
+                    for cc_file in cc_files:
+                        try:
+                            new_dfs.append(standardize_sbi_card_pdf(cc_file))
+                        except ValueError as e:
+                            skipped_files.append(f"**{cc_file.name}** — {e}")
+
                 if not new_dfs:
                     if skipped_files:
                         st.error("❌ Nothing could be processed. All uploaded files were skipped:\n\n" +
@@ -126,7 +144,7 @@ with tab_upload:
                 if skipped_files:
                     st.warning("⚠️ Some files were skipped:\n\n" + "\n".join(f"- {m}" for m in skipped_files))
                     
-                # 3. Combine newly uploaded data
+                # 4. Combine newly uploaded data
                 new_data = pd.concat(new_dfs, ignore_index=True)
                 new_data['is_reviewed'] = False
                 new_data.columns = [c.lower() for c in new_data.columns] # lowercase all columns
@@ -145,15 +163,15 @@ with tab_upload:
 
                 # bug #8 fix: see logic.merge_and_dedup for why a plain
                 # (date, description, amount, account) key isn't safe on its own.
-                # 4. Merge with Existing Database
+                # 5. Merge with Existing Database
                 existing_df = pd.read_excel(DB_FILE, sheet_name='transactions')
                 combined_df = merge_and_dedup(existing_df, new_data)
                     
-                # 5. RUN GLOBAL RECONCILIATION
+                # 6. RUN GLOBAL RECONCILIATION
                 from engine import run_global_reconciliation
                 final_df = run_global_reconciliation(combined_df)
                 
-                # 6. Save back to Excel
+                # 7. Save back to Excel
                 new_rows = len(final_df) - len(existing_df) if not existing_df.empty else len(final_df)
                 
                 rules_df = pd.read_excel(DB_FILE, sheet_name='category_rules')
@@ -210,7 +228,8 @@ with tab_triage:
                 ),
                 "type": st.column_config.SelectboxColumn(
                     "Type", 
-                    options=["Debit", "Credit", "Transfer", "Transfer_Splitwise_Base", "Transfer_Splitwise_Settlement", "Settlement"]
+                    options=["Debit", "Credit", "Transfer", "Transfer_Splitwise_Base", "Transfer_Splitwise_Settlement",
+                             "Transfer_CreditCard_Payment", "Transfer_CreditCard_Refund", "Settlement"]
                 ),
                 "match_notes": st.column_config.TextColumn("Match Info (Audit)", disabled=True)
             },
@@ -255,13 +274,13 @@ with tab_triage:
     # ==========================================
     st.divider()
     st.subheader("🔗 Manual Matcher")
-    st.write("Link Splitwise payments with Bank debits that the auto-engine missed (e.g., differing amounts or dates).")
+    st.write("Link a Splitwise payment or credit card bill payment with the Bank debit that the auto-engine missed (e.g., differing amounts or dates).")
     
     # Find candidates that have NO match notes
     unmatched_bank = df[(df['account_source'].isin(['HDFC Bank', 'SBI Bank', 'Bank'])) & (df['type'] == 'Debit') & (df['match_notes'] == '')]
-    unmatched_sw = df[(df['account_source'] == 'Splitwise') & (df['you_paid'] > 0) & (df['match_notes'] == '')]
+    unmatched_ledger = df[(~df['account_source'].isin(['HDFC Bank', 'SBI Bank', 'Bank'])) & (df['you_paid'] > 0) & (df['match_notes'] == '')]
     
-    if not unmatched_bank.empty and not unmatched_sw.empty:
+    if not unmatched_bank.empty and not unmatched_ledger.empty:
         col_m1, col_m2 = st.columns(2)
         
         with col_m1:
@@ -272,23 +291,28 @@ with tab_triage:
             selected_bank_str = st.selectbox("Select Unmatched Bank Debit", ["-- Select --"] + bank_opts)
             
         with col_m2:
-            sw_opts = unmatched_sw.apply(
-                lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['description']} | Paid: ₹{r['you_paid']}", axis=1
+            ledger_opts = unmatched_ledger.apply(
+                lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['account_source']} | {r['description']} | Paid: ₹{r['you_paid']}", axis=1
             ).tolist()
-            selected_sw_str = st.selectbox("Select Unmatched Splitwise Payment", ["-- Select --"] + sw_opts)
+            selected_ledger_str = st.selectbox("Select Unmatched Splitwise / Credit Card Payment", ["-- Select --"] + ledger_opts)
             
         if st.button("Manually Link Transactions"):
-            if selected_bank_str != "-- Select --" and selected_sw_str != "-- Select --":
+            if selected_bank_str != "-- Select --" and selected_ledger_str != "-- Select --":
                 import re
                 
                 # Extract the hidden row ID from the brackets e.g., "[42]" -> 42
                 b_idx = int(re.search(r'\[(\d+)\]', selected_bank_str).group(1))
-                s_idx = int(re.search(r'\[(\d+)\]', selected_sw_str).group(1))
+                s_idx = int(re.search(r'\[(\d+)\]', selected_ledger_str).group(1))
                 
-                # Apply the manual link
-                df.at[b_idx, 'type'] = 'Transfer_Splitwise_Base'
+                # Apply the manual link -- label depends on which ledger this came from
+                ledger_source = df.at[s_idx, 'account_source']
+                transfer_label = (
+                    'Transfer_CreditCard_Payment' if 'Credit Card' in str(ledger_source)
+                    else 'Transfer_Splitwise_Base'
+                )
+                df.at[b_idx, 'type'] = transfer_label
                 df.at[b_idx, 'category'] = 'Excluded'
-                df.at[b_idx, 'match_notes'] = f"🔗 Matched SW: {df.at[s_idx, 'description']}"
+                df.at[b_idx, 'match_notes'] = f"🔗 Matched: {df.at[s_idx, 'description']}"
                 
                 df.at[s_idx, 'match_notes'] = f"🔗 Matched Bank: {df.at[b_idx, 'description']}"
                 
@@ -301,7 +325,7 @@ with tab_triage:
                 st.success("✅ Successfully linked transactions!")
                 st.rerun()
             else:
-                st.warning("Please select both a Bank transaction and a Splitwise transaction to link them.")
+                st.warning("Please select both a Bank transaction and a Splitwise/Credit Card transaction to link them.")
     else:
         st.info("No unmatched transactions available for manual linking.")
 

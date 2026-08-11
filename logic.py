@@ -263,6 +263,90 @@ def standardize_sbi_excel(df):
     
     return clean_df
 
+# --- Credit card statements ------------------------------------------------
+# A credit card bill payment shows up in the bank statement as one lump debit
+# with no spending detail. Importing the card's own statement gives real,
+# itemized, categorizable transactions -- and the bank-side "bill payment"
+# becomes a transfer to exclude (same shape as the Splitwise you_paid <->
+# bank Debit match), not a second copy of the expense.
+_SBI_CARD_TXN_LINE_RE = re.compile(
+    r'^(\d{1,2}\s+[A-Za-z]{3}\s+\d{2})\s+(.+?)\s+([\d,]+\.\d{2})\s+(C|D)\s*$'
+)
+
+
+def parse_sbi_card_lines(lines):
+    """
+    Pure parser: turns a list of text lines (as extracted from an SBI Card
+    PDF statement, e.g. one page's text split on '\\n') into standardized
+    transaction rows. Kept separate from PDF I/O so it's unit-testable with
+    plain strings, no PDF file required.
+
+    Three kinds of line appear on an SBI Card statement:
+      - "...PAYMENT RECEIVED... <amount> C"  -- money paid from your bank
+        account to settle the bill. Never a real expense; becomes you_paid
+        so it can be matched against the corresponding bank Debit.
+      - any other "...<amount> C" line -- a refund/reversal credited back
+        to the card. Reduces spend, but isn't a bank transfer.
+      - "...<amount> D" -- a real purchase/expense.
+    """
+    rows = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        m = _SBI_CARD_TXN_LINE_RE.match(line)
+        if not m:
+            continue
+        date_str, desc, amount_str, flag = m.groups()
+        date = pd.to_datetime(date_str, format='%d %b %y', errors='coerce')
+        if pd.isna(date):
+            continue
+        amount = float(amount_str.replace(',', ''))
+        desc_clean = clean_bank_narration(desc)
+
+        is_bill_payment = (flag == 'C') and ('PAYMENT RECEIVED' in desc.upper())
+
+        if is_bill_payment:
+            rows.append(dict(
+                Date=date, Description=desc_clean, Amount=0.0, Type='Settlement',
+                Account_Source='SBI Credit Card', Category='Settlement',
+                you_paid=amount, you_received=0.0, Match_Notes="",
+            ))
+        elif flag == 'C':
+            # refund / reversal -- a real credit, not a transfer
+            rows.append(dict(
+                Date=date, Description=desc_clean, Amount=amount, Type='Credit',
+                Account_Source='SBI Credit Card', Category=None,
+                you_paid=0.0, you_received=0.0, Match_Notes="",
+            ))
+        else:
+            rows.append(dict(
+                Date=date, Description=desc_clean, Amount=amount, Type='Debit',
+                Account_Source='SBI Credit Card', Category=None,
+                you_paid=0.0, you_received=0.0, Match_Notes="",
+            ))
+
+    if not rows:
+        raise ValueError(
+            "No recognizable SBI Card transactions found in this statement. "
+            "Expected lines like 'DD Mon YY  <description>  <amount>  C|D'."
+        )
+    return pd.DataFrame(rows)
+
+
+def standardize_sbi_card_pdf(pdf_file):
+    """
+    Extracts and standardizes transactions from an SBI Card credit card PDF
+    statement. `pdf_file` can be a path or a file-like object (e.g. a
+    Streamlit UploadedFile) -- anything pdfplumber.open() accepts.
+    """
+    import pdfplumber
+    lines = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            lines.extend(text.split("\n"))
+    return parse_sbi_card_lines(lines)
+
+
 def standardize_hdfc_excel(df):
     """
     Cleans and standardizes HDFC Excel bank statements.
