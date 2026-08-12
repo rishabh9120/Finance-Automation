@@ -262,27 +262,39 @@ The current codebase is intentionally a minimum viable personal finance workflow
 
 ## Future scope
 
-This project has strong potential to expand into a more complete finance automation system.
+This project has strong potential to expand into a more complete finance automation system. The roadmap below is organized around the two concrete pain points that motivated it: **bulk-importing historical (backdated) data is tedious today**, and **there's no way to get new statements in without manually downloading and clicking through the uploader every time**.
 
-### Near-term improvements
-- PDF and OCR-based bank statement ingestion,
-- support more bank formats (ICICI, Axis, etc.),
-- CI automation for the existing pytest suite (e.g. GitHub Actions on every push),
-- improve duplicate detection further (e.g. handle statements that don't preserve row order across exports),
-- add a monthly/quarterly analytics dashboard.
+### Phase A — Make bulk/backdated import painless (near-term, pure software, no new infra)
+The pipeline already tolerates re-uploads and overlapping date ranges cleanly (`merge_and_dedup`), so the real friction in a large backfill is UI mechanics, not data correctness. Target that directly:
+- **Splitwise API sync** (the flagship item here — see below).
+- **A CLI ingestion script** (`ingest.py`) that calls the exact same `logic.py`/`engine.py` functions the Streamlit app uses, so a whole folder of historical statements (`ingest.py --bank hdfc statements/*.xls`) can be backfilled in one command instead of clicking through the uploader file-by-file. This is the highest-leverage, lowest-risk next step for bank/card statements, which don't have a public API to fall back on.
+- **Bulk actions in the Triage queue** — multi-row select + "apply this category to all selected," and a one-click "accept all rule-matched suggestions" so backfilling months of history doesn't mean scrolling through hundreds of individual dropdowns.
+- **A backfill-aware categorization pass** — when importing a large historical batch, run `apply_category_rules` iteratively so a rule learned from row 50 of the batch can auto-apply to a similar row 800 later in the same batch, not just on the *next* upload.
+- Support more bank/card formats (ICICI, Axis, HDFC Credit Card, etc.) and PDF/OCR bank statement ingestion, since backfilling often means pulling from more than one institution.
 
-### Medium-term improvements
-- migrate from Excel to SQLite or PostgreSQL,
-- store raw statement metadata, ingestion history, and audit trails,
-- expand the rule engine beyond substring matching (e.g. fuzzy matching, per-account rules),
-- add forecasting and budget tracking.
+#### Splitwise sync — the official API isn't reliably free, so use one of these instead
+Splitwise's own API Terms of Use state: *"Splitwise may impose conditions on the use of the Self-Serve API, including, for example, maintaining an active Splitwise Pro subscription."* So the API route from the earlier draft of this roadmap isn't a safe assumption — don't build against `GET /get_expenses` expecting free access. Two free alternatives, in order of how much they're worth building:
 
-### Long-term vision
-- create a full personal finance assistant that can:
-  - classify transactions automatically,
-  - reconcile multiple accounts and payment sources,
-  - generate expense summaries and month-end reports,
-  - support recurring budgets, savings goals, and anomaly detection.
+1. **Automate the download of the existing free CSV export, not the API.** Splitwise's CSV export (what `standardize_splitwise_data` already parses) is a normal, free, no-subscription web feature. A small browser-automation script (Playwright/Selenium) can log into Splitwise on a schedule, click the group's "Export as CSV" link, and drop the file straight into the Phase B watched-folder pipeline below — so Splitwise ends up on the *exact same* automated path as bank/card statements, no separate infrastructure needed. Worth being upfront about the tradeoffs before building this: it's more fragile than an API (breaks if Splitwise changes their page layout), and scripted/automated access to a web app's UI for personal use — while a very common pattern — sits in the kind of gray area most consumer web ToS technically discourage, even when no one enforces it for individual accounts. That's a judgment call for you to make, not a blocker on my end.
+2. **Parse Splitwise's own notification emails.** If email notifications are enabled, Splitwise emails you on every new expense with the amount/description in the body. This reuses the exact same IMAP-polling infrastructure already planned for bank statement emails in Phase B, so it's close to free to add once that exists — but it's less structured to parse reliably than a CSV row, and won't catch retroactive edits/deletes the way a true API sync could.
+
+Given the ToS uncertainty, **the pragmatic default for now is: keep the free CSV export as the source of truth, and automate the download step (option 1) rather than the ingestion logic** — the parsing/categorization/reconciliation side is already done and already free.
+
+### Phase B — Automate recurring ingestion (medium-term, needs scheduling + credentials handling)
+This is what actually removes the "download the statement, then remember to upload it" loop:
+- **Watched-folder auto-import** — a background script (run via cron / Task Scheduler / `launchd`) watches a designated folder and runs any new file through the standard pipeline automatically the moment it lands there (e.g. from a browser's default download folder, or from the Splitwise CSV-download automation above). No email or bank integration required, and it's the simplest version of "automate it."
+- **Email-based auto-fetch** — most banks/card issuers (and optionally Splitwise, per above) email something every cycle. An IMAP-based script can poll a mailbox (or a dedicated forwarding rule/label), recognize known statement/notification emails by sender/subject, download attachments, decrypt password-protected PDFs (issuer passwords are usually a deterministic formula like DOB+PAN), and feed it straight into the pipeline. This is the real fix for "get frequent statements automatically" for banks/cards — but **it means storing IMAP credentials and statement-decryption secrets locally**, which needs a clear-eyed security design (e.g. an OS keychain, not a config file in plaintext) before it's built, not after.
+- **Scheduled runs with a visible sync status** — nightly/weekly cron job (which can now also re-run the Phase A Splitwise sync on a timer), plus a "last synced: X new transactions, Y need review" indicator in the dashboard so automation doesn't mean losing visibility into what happened.
+- Once ingestion can run unattended, **migrate off Excel to SQLite/PostgreSQL** becomes higher priority (a background script and an open Streamlit session both writing to the same `.xlsx` file is a real corruption/locking risk that a proper DB avoids).
+
+### Phase C — Long-term
+- **Bank Account Aggregator (AA) / open banking API integration** (India's RBI-regulated AA framework, or a developer-friendly aggregator like Setu) for consent-based, near-real-time transaction pull — removes statement parsing entirely for participating institutions, but is a much bigger compliance/integration lift than Phases A/B and is realistically a "if this grows beyond personal use" step, not a next sprint.
+- Store raw statement metadata, ingestion history, and audit trails (which becomes essential once ingestion is automatic and unattended — you want to know *when* and *from what* every row arrived).
+- Expand the rule engine beyond substring matching (fuzzy matching, per-account rules).
+- Forecasting, budget tracking, recurring-expense detection, anomaly detection.
+- Create a full personal finance assistant that can classify transactions automatically, reconcile multiple accounts and payment sources, generate expense summaries and month-end reports, and support recurring budgets, savings goals, and anomaly detection.
+
+**Suggested order:** Phase A first — it's a few hours of low-risk work reusing code that's already tested, and it directly solves "backdated entries are tedious" without touching credentials or scheduling. Phase B (specifically the watched-folder version before the email version) is the natural next step once A is in place. Phase C is a different scale of project and shouldn't block either.
 
 ## Working assumptions for future AI edits
 

@@ -87,8 +87,21 @@ See `TESTING.md` for a breakdown of what each test file covers and how to run a 
 
 ## Future ideas
 
-- PDF and OCR-based bank statement ingestion,
-- support for more banks, credit card issuers, and statement formats (ICICI, Axis, HDFC Credit Card, etc.),
-- CI automation for the test suite (e.g. GitHub Actions),
-- reporting dashboards for monthly spend analysis,
-- move the transaction store from Excel to SQLite or a proper database backend.
+Roadmap for making bulk/backdated import easier and automating recurring statement ingestion (see `CLAUDE.md` for the full phased breakdown):
+
+**Near-term (backfill pain):**
+- **automate the free Splitwise CSV export** rather than the official API — Splitwise's API terms allow them to require an active Splitwise Pro subscription, so it's not a reliably free path. A scheduled browser-automation script downloading the same CSV export you'd download by hand (worth knowing: more fragile than an API, and a light ToS gray area for any site) is the practical free alternative, and it slots into the same "watched folder" automation as bank/card statements below.
+- a command-line ingestion script so a whole folder of historical bank/card statements can be imported in one run instead of clicking through the uploader file-by-file,
+- bulk actions in the Triage queue (multi-select + apply category, accept-all for rule-matched rows),
+- support for more banks and credit card issuers.
+
+**Medium-term (automate recurring imports):**
+- a watched-folder auto-importer that picks up newly downloaded bank/card statements automatically,
+- email-based auto-fetch for statements issuers send every cycle (needs careful credential/security handling before it's built),
+- a visible "last synced" status once ingestion runs unattended,
+- move the transaction store from Excel to SQLite/PostgreSQL (more important once something other than you is writing to it).
+
+**Long-term:**
+- Account Aggregator / open banking API integration for consent-based automatic transaction pull,
+- reporting dashboards, budget tracking, and anomaly detection,
+- CI automation for the test suite.
