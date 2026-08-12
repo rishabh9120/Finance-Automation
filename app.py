@@ -4,6 +4,8 @@ import numpy as np
 import re
 import plotly.express as px
 import os
+from datetime import date
+
 from engine import run_global_reconciliation
 from database import init_db, DB_FILE
 from logic import (
@@ -20,21 +22,94 @@ from logic import (
     standardize_splitwise_data,
     finalize_splitwise_category,
     merge_and_dedup,
+    create_manual_entry_row,
 )
+import splitwise_api
 
 # Ensure the Excel DB exists before the app runs
 init_db()
+
+CATEGORY_OPTIONS = [
+    "Uncategorized", "Groceries", "Eating Out", "Party", "Transport", "Utilities",
+    "Shopping", "Home Setup", "Travel - Weekend", "Travel - Major", "Rent", "General",
+]
+
+
+def save_new_transactions(new_dfs):
+    """
+    Shared "commit a batch of new transactions" pipeline, used by every
+    entry point that produces standardized rows -- file upload, the
+    Splitwise API sync, and manual entry -- so the merge/dedup/reconcile/
+    save sequence (and its column-safety checks) lives in exactly one
+    place instead of being copy-pasted per entry point.
+
+    Input:
+        new_dfs (list[pd.DataFrame]): one or more standardized DataFrames
+            (the output of any standardize_* function, or
+            create_manual_entry_row), all sharing the same base columns
+            (Date, Description, Amount, Type, Account_Source, Category, ...).
+
+    Output:
+        int: how many transactions were newly added (existing rows that
+        deduplicated away don't count).
+
+    Edge cases:
+        - Raises ValueError if `new_dfs` is empty -- callers are expected
+          to have already checked for this and shown their own
+          context-specific warning before calling.
+        - Safety columns (category/you_paid/you_received/match_notes) are
+          filled in here if a caller's DataFrame doesn't already have them,
+          so create_manual_entry_row() (which doesn't set you_paid/
+          you_received/match_notes at all) works without any special-casing.
+    """
+    if not new_dfs:
+        raise ValueError("save_new_transactions() called with no data to save.")
+
+    new_data = pd.concat(new_dfs, ignore_index=True)
+    new_data['is_reviewed'] = False
+    new_data.columns = [c.lower() for c in new_data.columns]  # lowercase all columns
+
+    # Ensure safety columns exist
+    if 'category' not in new_data.columns: new_data['category'] = 'Uncategorized'
+    if 'you_paid' not in new_data.columns: new_data['you_paid'] = 0.0
+    if 'you_received' not in new_data.columns: new_data['you_received'] = 0.0
+    if 'match_notes' not in new_data.columns: new_data['match_notes'] = ""
+    new_data['category'] = new_data['category'].fillna('Uncategorized')
+
+    # item #1: apply learned category_rules to whatever is still
+    # Uncategorized (mainly bank Debit/Credit rows -- Splitwise rows
+    # already got a category from their own Splitwise category, item #4).
+    new_data = apply_category_rules(new_data)
+
+    # bug #8 fix: see logic.merge_and_dedup for why a plain
+    # (date, description, amount, account) key isn't safe on its own.
+    existing_df = pd.read_excel(DB_FILE, sheet_name='transactions')
+    combined_df = merge_and_dedup(existing_df, new_data)
+
+    final_df = run_global_reconciliation(combined_df)
+
+    new_rows = len(final_df) - len(existing_df) if not existing_df.empty else len(final_df)
+
+    rules_df = pd.read_excel(DB_FILE, sheet_name='category_rules')
+    with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
+        final_df.to_excel(writer, sheet_name='transactions', index=False)
+        rules_df.to_excel(writer, sheet_name='category_rules', index=False)
+
+    return new_rows
+
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Finance Dashboard", layout="wide")
 st.title("Personal Finance Tracker")
 
-tab_upload, tab_triage, tab_analysis = st.tabs(["Upload & Sync", "Triage Queue", "Expense Analysis"])
+tab_upload, tab_manual, tab_triage, tab_analysis = st.tabs(
+    ["Upload & Sync", "Manual Entry", "Triage Queue", "Expense Analysis"]
+)
 
 with tab_upload:
     st.header("Upload Statements")
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         # Accept multiple bank files (Optional)
         bank_files = st.file_uploader("Upload Bank File(s) (Optional)", type=['csv', 'pdf', 'xlsx', 'xls'], accept_multiple_files=True)
@@ -50,23 +125,22 @@ with tab_upload:
                  "the corresponding bill payment in your bank statement is automatically excluded once matched, "
                  "so it isn't counted as a second expense."
         )
-        
+
     # Dynamically create category dropdowns for Splitwise files BEFORE processing
     sw_categories = {}
     if sw_files:
         st.write("---")
         st.subheader("Fallback Category for Unmapped Splitwise Categories")
         st.caption("Each expense's own Splitwise category (Groceries, Car, Rent, etc.) is mapped automatically. This is only used when a Splitwise category has no mapping yet.")
-        
+
         for sw_file in sw_files:
             sw_categories[sw_file.name] = st.selectbox(
-                f"Fallback for '{sw_file.name}'", 
-                # Updated options list:
-                options=["Uncategorized", "Groceries", "Eating Out", "Party", "Transport", "Utilities", "Shopping", "Home Setup", "Travel - Weekend", "Travel - Major", "Rent", "General"],
+                f"Fallback for '{sw_file.name}'",
+                options=CATEGORY_OPTIONS,
                 key=f"cat_{sw_file.name}"
             )
         st.write("---")
-        
+
     if st.button("Process Files"):
         if not bank_files and not sw_files and not cc_files:
             st.warning("⚠️ Please upload at least one Bank statement, Splitwise CSV, or Credit Card statement to process.")
@@ -81,7 +155,7 @@ with tab_upload:
                         fname_lower = bank_file.name.lower()
                         if fname_lower.endswith(('.xlsx', '.xls')):
                             raw_bank_df = pd.read_excel(bank_file, header=None)
-                            
+
                             # Auto-Detect
                             bank_type = "Unknown"
                             for _, row in raw_bank_df.head(30).iterrows():
@@ -92,7 +166,7 @@ with tab_upload:
                                 elif 'details' in row_str.values and 'debit' in row_str.values:
                                     bank_type = "SBI"
                                     break
-                                    
+
                             if bank_type == "HDFC":
                                 new_dfs.append(standardize_hdfc_excel(raw_bank_df))
                             elif bank_type == "SBI":
@@ -115,7 +189,7 @@ with tab_upload:
                             )
                         else:
                             skipped_files.append(f"**{bank_file.name}** — unsupported file type.")
-                
+
                 # 2. Standardize Splitwise Files
                 if sw_files:
                     for sw_file in sw_files:
@@ -143,73 +217,141 @@ with tab_upload:
 
                 if skipped_files:
                     st.warning("⚠️ Some files were skipped:\n\n" + "\n".join(f"- {m}" for m in skipped_files))
-                    
-                # 4. Combine newly uploaded data
-                new_data = pd.concat(new_dfs, ignore_index=True)
-                new_data['is_reviewed'] = False
-                new_data.columns = [c.lower() for c in new_data.columns] # lowercase all columns
-                
-                # Ensure safety columns exist
-                if 'category' not in new_data.columns: new_data['category'] = 'Uncategorized'
-                if 'you_paid' not in new_data.columns: new_data['you_paid'] = 0.0
-                if 'you_received' not in new_data.columns: new_data['you_received'] = 0.0
-                if 'match_notes' not in new_data.columns: new_data['match_notes'] = ""
-                new_data['category'] = new_data['category'].fillna('Uncategorized')
 
-                # item #1: apply learned category_rules to whatever is still
-                # Uncategorized (mainly bank Debit/Credit rows -- Splitwise rows
-                # already got a category from their own Splitwise category, item #4).
-                new_data = apply_category_rules(new_data)
-
-                # bug #8 fix: see logic.merge_and_dedup for why a plain
-                # (date, description, amount, account) key isn't safe on its own.
-                # 5. Merge with Existing Database
-                existing_df = pd.read_excel(DB_FILE, sheet_name='transactions')
-                combined_df = merge_and_dedup(existing_df, new_data)
-                    
-                # 6. RUN GLOBAL RECONCILIATION
-                from engine import run_global_reconciliation
-                final_df = run_global_reconciliation(combined_df)
-                
-                # 7. Save back to Excel
-                new_rows = len(final_df) - len(existing_df) if not existing_df.empty else len(final_df)
-                
-                rules_df = pd.read_excel(DB_FILE, sheet_name='category_rules')
-                with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
-                    final_df.to_excel(writer, sheet_name='transactions', index=False)
-                    rules_df.to_excel(writer, sheet_name='category_rules', index=False)
-                    
+                new_rows = save_new_transactions(new_dfs)
                 st.success(f"✅ Processed successfully! {new_rows} new transactions added. Global matching applied.")
-                
+
             except Exception as e:
                 st.error(f"❌ An unexpected error occurred: {e}")
+
+    # ==========================================
+    # --- SPLITWISE API SYNC (feature: direct Splitwise API access) ---
+    # ==========================================
+    # An alternative to "export a CSV, then upload it" -- pulls expenses
+    # straight from Splitwise's own API using a personal API key, so a
+    # recurring sync no longer needs a manual export step at all.
+    st.divider()
+    st.subheader("🔄 Sync Directly from Splitwise")
+    st.caption(
+        "Pulls new expenses straight from your Splitwise account via the API -- no CSV export needed. "
+        "Generate a personal API key at [secure.splitwise.com/apps](https://secure.splitwise.com/apps)."
+    )
+
+    sw_api_key = st.text_input(
+        "Splitwise API Key", type="password",
+        help="Stored only for this session -- never written to disk. You can also set the "
+             "SPLITWISE_API_KEY environment variable to skip entering it here.",
+    )
+    sw_api_fallback_category = st.selectbox(
+        "Fallback Category for Unmapped Splitwise Categories", options=CATEGORY_OPTIONS, key="sw_api_fallback"
+    )
+
+    last_sync = splitwise_api.get_last_sync_time()
+    if last_sync:
+        st.caption(f"Last synced: {last_sync}")
+        sync_incremental = st.checkbox("Only fetch expenses since last sync", value=True)
+    else:
+        st.caption("No previous sync found -- next sync will fetch your full Splitwise history.")
+        sync_incremental = False
+
+    if st.button("Sync Now"):
+        if not sw_api_key and not os.environ.get("SPLITWISE_API_KEY"):
+            st.warning("⚠️ Please enter a Splitwise API key (or set SPLITWISE_API_KEY) before syncing.")
+        else:
+            try:
+                dated_after = last_sync if sync_incremental else None
+                raw_df, resolved_user_name = splitwise_api.fetch_splitwise_expenses_df(
+                    api_key=sw_api_key or None, dated_after=dated_after,
+                )
+
+                if raw_df.empty:
+                    st.info("No new Splitwise expenses to sync.")
+                else:
+                    clean_sw = standardize_splitwise_data(raw_df, user_name=resolved_user_name)
+                    clean_sw = finalize_splitwise_category(clean_sw, sw_api_fallback_category)
+
+                    if clean_sw.empty:
+                        st.info("Fetched expenses, but none resulted in a trackable transaction (e.g. all net-zero splits).")
+                    else:
+                        new_rows = save_new_transactions([clean_sw])
+                        st.success(f"✅ Synced successfully as **{resolved_user_name}**! {new_rows} new transactions added.")
+
+                # Only mark the sync as complete once the fetch (and, if there
+                # was data, the save) both succeeded -- see set_last_sync_time
+                # docstring for why this ordering matters.
+                splitwise_api.set_last_sync_time()
+
+            except Exception as e:
+                st.error(f"❌ Splitwise sync failed: {e}")
+
+with tab_manual:
+    # ==========================================
+    # --- MANUAL ENTRY (feature: backdated / no-statement transactions) ---
+    # ==========================================
+    st.header("Manual Entry")
+    st.write(
+        "Add a single transaction directly -- for backdated cash spends, or anything you don't have "
+        "a bank statement, Splitwise export, or card statement for."
+    )
+
+    with st.form("manual_entry_form", clear_on_submit=True):
+        me_col1, me_col2 = st.columns(2)
+        with me_col1:
+            me_date = st.date_input("Date", value=date.today())
+            me_amount = st.number_input("Amount", min_value=0.0, step=1.0, format="%.2f")
+            me_type = st.radio("Type", options=["Debit", "Credit"], horizontal=True)
+        with me_col2:
+            me_description = st.text_input("Description")
+            me_category = st.selectbox("Category", options=CATEGORY_OPTIONS)
+            me_account_source = st.text_input(
+                "Source", value="Manual Entry",
+                help="Defaults to 'Manual Entry'. Change this if you want to tag it as, e.g., 'Cash'."
+            )
+
+        submitted = st.form_submit_button("Add Transaction")
+
+    if submitted:
+        try:
+            manual_row = create_manual_entry_row(
+                date=me_date, description=me_description, amount=me_amount,
+                txn_type=me_type, category=me_category, account_source=me_account_source or "Manual Entry",
+            )
+            new_rows = save_new_transactions([manual_row])
+            if new_rows:
+                st.success(f"✅ Added: {me_description} — ₹{me_amount:.2f} ({me_type})")
+            else:
+                st.info("This looks like a duplicate of an existing transaction (same date/description/amount/source) -- not added again.")
+        except ValueError as e:
+            st.warning(f"⚠️ {e}")
+        except Exception as e:
+            st.error(f"❌ An unexpected error occurred: {e}")
+
 with tab_triage:
     st.header("Triage Queue (Review & Categorize)")
-    
+
     df = pd.read_excel(DB_FILE, sheet_name='transactions')
-    
+
     # 1. Ensure columns exist
     if 'match_notes' not in df.columns: df['match_notes'] = ""
     if 'you_paid' not in df.columns: df['you_paid'] = 0.0
     if 'you_received' not in df.columns: df['you_received'] = 0.0
     if 'your_share' not in df.columns: df['your_share'] = df['amount']
-        
+
     # 2. FIX: Convert Excel 'NaN' blanks back into standard empty strings and zeros
     df['match_notes'] = df['match_notes'].fillna("")
     df['you_paid'] = df['you_paid'].fillna(0.0)
     df['you_received'] = df['you_received'].fillna(0.0)
     df['your_share'] = df['your_share'].fillna(df['amount'])
-        
+
     unreviewed_mask = df['is_reviewed'] == False
     unreviewed_df = df[unreviewed_mask]
-    
+
     if not unreviewed_df.empty:
         st.write("Confirm Categories and Auto-detected Transfers:")
-        
+
         display_cols = ['date', 'description', 'amount', 'you_paid', 'you_received', 'your_share', 'account_source', 'is_reviewed', 'category', 'type', 'match_notes']
         ui_df = unreviewed_df[display_cols]
-        
-      
+
         edited_df = st.data_editor(
             ui_df,
             column_config={
@@ -222,20 +364,19 @@ with tab_triage:
                 "account_source": st.column_config.TextColumn("Source", disabled=True),
                 "is_reviewed": st.column_config.CheckboxColumn("Reviewed ✅", default=False),
                 "category": st.column_config.SelectboxColumn(
-                    "Category", 
-                    # Updated options list:
+                    "Category",
                     options=["Groceries", "Eating Out", "Party", "Transport", "Utilities", "Shopping", "Home Setup", "Travel - Weekend", "Travel - Major", "Rent", "General", "Demat Transfer", "Settlement", "Excluded", "Uncategorized"]
                 ),
                 "type": st.column_config.SelectboxColumn(
-                    "Type", 
+                    "Type",
                     options=["Debit", "Credit", "Transfer", "Transfer_Splitwise_Base", "Transfer_Splitwise_Settlement",
                              "Transfer_CreditCard_Payment", "Transfer_CreditCard_Refund", "Settlement"]
                 ),
                 "match_notes": st.column_config.TextColumn("Match Info (Audit)", disabled=True)
             },
-            hide_index=False 
+            hide_index=False
         )
-        
+
         if st.button("Save Changes to Database"):
             # item #1: learn from any category a human just set/corrected, so
             # the same merchant is auto-categorized next time instead of
@@ -265,7 +406,7 @@ with tab_triage:
                 st.success(f"Database updated! Learned {learned_count} new categorization rule(s) for next time.")
             else:
                 st.success("Database updated!")
-            st.rerun() 
+            st.rerun()
     else:
         st.info("No new transactions to review.")
 
@@ -275,53 +416,52 @@ with tab_triage:
     st.divider()
     st.subheader("🔗 Manual Matcher")
     st.write("Link a Splitwise payment or credit card bill payment with the Bank debit that the auto-engine missed (e.g., differing amounts or dates).")
-    
+
     # Find candidates that have NO match notes
     unmatched_bank = df[(df['account_source'].isin(['HDFC Bank', 'SBI Bank', 'Bank'])) & (df['type'] == 'Debit') & (df['match_notes'] == '')]
     unmatched_ledger = df[(~df['account_source'].isin(['HDFC Bank', 'SBI Bank', 'Bank'])) & (df['you_paid'] > 0) & (df['match_notes'] == '')]
-    
+
     if not unmatched_bank.empty and not unmatched_ledger.empty:
         col_m1, col_m2 = st.columns(2)
-        
+
         with col_m1:
             # Create a readable dropdown format: [Row ID] Date | Description | Amount
             bank_opts = unmatched_bank.apply(
                 lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['description']} | ₹{r['amount']}", axis=1
             ).tolist()
             selected_bank_str = st.selectbox("Select Unmatched Bank Debit", ["-- Select --"] + bank_opts)
-            
+
         with col_m2:
             ledger_opts = unmatched_ledger.apply(
                 lambda r: f"[{r.name}] {r['date'].strftime('%d %b %Y')} | {r['account_source']} | {r['description']} | Paid: ₹{r['you_paid']}", axis=1
             ).tolist()
             selected_ledger_str = st.selectbox("Select Unmatched Splitwise / Credit Card Payment", ["-- Select --"] + ledger_opts)
-            
+
         if st.button("Manually Link Transactions"):
             if selected_bank_str != "-- Select --" and selected_ledger_str != "-- Select --":
-                import re
-                
                 # Extract the hidden row ID from the brackets e.g., "[42]" -> 42
                 b_idx = int(re.search(r'\[(\d+)\]', selected_bank_str).group(1))
                 s_idx = int(re.search(r'\[(\d+)\]', selected_ledger_str).group(1))
-                
+
                 # Apply the manual link -- label depends on which ledger this came from
                 ledger_source = df.at[s_idx, 'account_source']
                 transfer_label = (
                     'Transfer_CreditCard_Payment' if 'Credit Card' in str(ledger_source)
                     else 'Transfer_Splitwise_Base'
                 )
+
                 df.at[b_idx, 'type'] = transfer_label
                 df.at[b_idx, 'category'] = 'Excluded'
                 df.at[b_idx, 'match_notes'] = f"🔗 Matched: {df.at[s_idx, 'description']}"
-                
+
                 df.at[s_idx, 'match_notes'] = f"🔗 Matched Bank: {df.at[b_idx, 'description']}"
-                
+
                 # Save to Database
                 rules_df = pd.read_excel(DB_FILE, sheet_name='category_rules')
                 with pd.ExcelWriter(DB_FILE, engine='openpyxl') as writer:
                     df.to_excel(writer, sheet_name='transactions', index=False)
                     rules_df.to_excel(writer, sheet_name='category_rules', index=False)
-                    
+
                 st.success("✅ Successfully linked transactions!")
                 st.rerun()
             else:
@@ -356,8 +496,6 @@ with tab_triage:
 
         if st.button("Manually Link Settlement"):
             if selected_credit_str != "-- Select --" and selected_sw_recv_str != "-- Select --":
-                import re
-
                 c_idx = int(re.search(r'\[(\d+)\]', selected_credit_str).group(1))
                 s_idx = int(re.search(r'\[(\d+)\]', selected_sw_recv_str).group(1))
 
@@ -381,44 +519,44 @@ with tab_triage:
 
 with tab_analysis:
     st.header("Expense Analysis")
-    
+
     df = pd.read_excel(DB_FILE, sheet_name='transactions')
-    
+
     clean_df = df[
-        (df['is_reviewed'] == True) & 
-        (df['type'] == 'Debit') & 
-        (df['category'] != 'Excluded') & 
+        (df['is_reviewed'] == True) &
+        (df['type'] == 'Debit') &
+        (df['category'] != 'Excluded') &
         (df['category'] != 'Settlement') &
         (~df['category'].astype(str).str.contains('Transfer', case=False, na=False))
     ].copy()
-    
+
     if not clean_df.empty:
         clean_df['date'] = pd.to_datetime(clean_df['date'])
-        
+
         col_chart1, col_chart2 = st.columns(2)
-        
+
         with col_chart1:
             st.subheader("Monthly Expenses")
             clean_df['Month'] = clean_df['date'].dt.to_period('M').astype(str)
             monthly_trend = clean_df.groupby('Month')['amount'].sum().reset_index()
-            
+
             fig_bar = px.bar(
-                monthly_trend, x='Month', y='amount', text='amount', 
+                monthly_trend, x='Month', y='amount', text='amount',
                 title="Total Spend per Month", color_discrete_sequence=['#4C72B0']
             )
             fig_bar.update_traces(texttemplate='₹%{text:.2s}', textposition='outside')
             st.plotly_chart(fig_bar, use_container_width=True)
-            
+
         with col_chart2:
             st.subheader("Category Breakdown")
             cat_breakdown = clean_df.groupby('category')['amount'].sum().reset_index()
-            
+
             fig_pie = px.pie(
-                cat_breakdown, values='amount', names='category', 
+                cat_breakdown, values='amount', names='category',
                 title="Where is your money going?", hole=0.4
             )
             st.plotly_chart(fig_pie, use_container_width=True)
-            
+
         st.subheader("Raw Data Summary")
         st.dataframe(clean_df.sort_values(by='date', ascending=False), use_container_width=True)
     else:

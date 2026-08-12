@@ -1,9 +1,10 @@
 """
 Pure, framework-free business logic for the finance tracker: bank-statement
-standardization, Splitwise standardization, narration cleanup, and the
-category-rule engine. Deliberately has ZERO dependency on Streamlit (or
-DB_FILE-writing side effects beyond reading category_rules) so it can be
-unit-tested directly, without faking a browser session.
+standardization, credit card statement standardization, Splitwise
+standardization, manual entry, narration cleanup, and the category-rule
+engine. Deliberately has ZERO dependency on Streamlit (or DB_FILE-writing
+side effects beyond reading category_rules) so it can be unit-tested
+directly, without faking a browser session.
 
 `app.py` imports everything it needs for the UI from this module.
 """
@@ -203,7 +204,6 @@ def merge_and_dedup(existing_df, new_data):
     return combined_df.reset_index(drop=True)
 
 
-
 def standardize_sbi_excel(df):
     """
     Cleans and standardizes SBI Excel bank statements.
@@ -215,21 +215,21 @@ def standardize_sbi_excel(df):
         if 'details' in row_str.values and 'debit' in row_str.values:
             header_idx = idx
             break
-            
+
     if header_idx is None:
         raise ValueError("Could not find the header row containing 'Details' and 'Debit'. Ensure this is a valid SBI statement.")
 
     # 2. Rebuild the dataframe starting from the actual header
     new_cols = df.iloc[header_idx].astype(str).str.strip().tolist()
-    clean_df = df.iloc[header_idx + 1:].copy() 
+    clean_df = df.iloc[header_idx + 1:].copy()
     clean_df.columns = new_cols
 
     # 3. Drop rows that are entirely NaN or footer metadata
     clean_df = clean_df.dropna(how='all')
     # Filter out empty dates or summary lines at the bottom
-    clean_df = clean_df.dropna(subset=['Date']) 
+    clean_df = clean_df.dropna(subset=['Date'])
     clean_df = clean_df[clean_df['Date'].astype(str).str.strip() != '']
-    
+
     # 4. Standardize column names
     column_mapping = {
         "Date": "Date",
@@ -240,28 +240,29 @@ def standardize_sbi_excel(df):
         "Balance": "Balance"
     }
     clean_df = clean_df.rename(columns=column_mapping)
-    
+
     # 5. Clean up description text -- item #2: extract the merchant/payee name
     # out of raw UPI/IMPS/ACH boilerplate so category rules have something to match.
     clean_df['Description'] = clean_df['Description'].astype(str).apply(clean_bank_narration)
-    
+
     # 6. Clean and Merge Amounts
     if 'Debit_Amount' in clean_df.columns and 'Credit_Amount' in clean_df.columns:
         # Convert amounts to numeric, handle missing values
         clean_df['Debit_Amount'] = pd.to_numeric(clean_df['Debit_Amount'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         clean_df['Credit_Amount'] = pd.to_numeric(clean_df['Credit_Amount'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        
+
         # Unified Amount and Type columns
         clean_df['Amount'] = np.where(clean_df['Debit_Amount'] > 0, clean_df['Debit_Amount'], clean_df['Credit_Amount'])
         clean_df['Type'] = np.where(clean_df['Debit_Amount'] > 0, 'Debit', 'Credit')
-        
+
     # 7. Final cleanup
     # SBI dates are usually DD/MM/YYYY or DD-MM-YYYY
     clean_df['Date'] = pd.to_datetime(clean_df['Date'], dayfirst=True, errors='coerce')
-    clean_df = clean_df.dropna(subset=['Date', 'Amount']) 
+    clean_df = clean_df.dropna(subset=['Date', 'Amount'])
     clean_df['Account_Source'] = 'SBI Bank'
-    
+
     return clean_df
+
 
 # --- Credit card statements ------------------------------------------------
 # A credit card bill payment shows up in the bank statement as one lump debit
@@ -282,7 +283,7 @@ def parse_sbi_card_lines(lines):
     plain strings, no PDF file required.
 
     Three kinds of line appear on an SBI Card statement:
-      - "...PAYMENT RECEIVED... <amount> C"  -- money paid from your bank
+      - "...PAYMENT RECEIVED... <amount> C" -- money paid from your bank
         account to settle the bill. Never a real expense; becomes you_paid
         so it can be matched against the corresponding bank Debit.
       - any other "...<amount> C" line -- a refund/reversal credited back
@@ -295,13 +296,14 @@ def parse_sbi_card_lines(lines):
         m = _SBI_CARD_TXN_LINE_RE.match(line)
         if not m:
             continue
+
         date_str, desc, amount_str, flag = m.groups()
         date = pd.to_datetime(date_str, format='%d %b %y', errors='coerce')
         if pd.isna(date):
             continue
+
         amount = float(amount_str.replace(',', ''))
         desc_clean = clean_bank_narration(desc)
-
         is_bill_payment = (flag == 'C') and ('PAYMENT RECEIVED' in desc.upper())
 
         if is_bill_payment:
@@ -327,8 +329,9 @@ def parse_sbi_card_lines(lines):
     if not rows:
         raise ValueError(
             "No recognizable SBI Card transactions found in this statement. "
-            "Expected lines like 'DD Mon YY  <description>  <amount>  C|D'."
+            "Expected lines like 'DD Mon YY <description> <amount> C|D'."
         )
+
     return pd.DataFrame(rows)
 
 
@@ -358,19 +361,19 @@ def standardize_hdfc_excel(df):
         if 'narration' in row_str.values and 'date' in row_str.values:
             header_idx = idx
             break
-            
+
     if header_idx is None:
         raise ValueError("Could not find the header row containing 'Date' and 'Narration'. Ensure this is a valid HDFC statement.")
 
     # 2. Rebuild the dataframe starting from the actual header
     new_cols = df.iloc[header_idx].astype(str).str.strip().tolist()
-    clean_df = df.iloc[header_idx + 2:].copy() 
+    clean_df = df.iloc[header_idx + 2:].copy()
     clean_df.columns = new_cols
 
     # 3. Drop rows that are entirely NaN or just trailing metadata
     clean_df = clean_df.dropna(how='all')
     clean_df = clean_df[~clean_df['Date'].astype(str).str.contains('Statement', case=False, na=False)]
-    
+
     # 4. Standardize the column names
     column_mapping = {
         "Date": "Date",
@@ -381,7 +384,7 @@ def standardize_hdfc_excel(df):
         "Deposit Amt.": "Credit_Amount",
         "Closing Balance": "Balance"
     }
-    
+
     clean_df = clean_df.rename(columns=column_mapping)
 
     # 5. Clean up description text -- item #2: extract the merchant/payee name
@@ -392,18 +395,19 @@ def standardize_hdfc_excel(df):
     if 'Debit_Amount' in clean_df.columns and 'Credit_Amount' in clean_df.columns:
         clean_df['Debit_Amount'] = pd.to_numeric(clean_df['Debit_Amount'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
         clean_df['Credit_Amount'] = pd.to_numeric(clean_df['Credit_Amount'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-        
+
         clean_df['Amount'] = np.where(clean_df['Debit_Amount'] > 0, clean_df['Debit_Amount'], clean_df['Credit_Amount'])
         clean_df['Type'] = np.where(clean_df['Debit_Amount'] > 0, 'Debit', 'Credit')
 
     # 7. Final cleanup of essential columns
     clean_df['Date'] = pd.to_datetime(clean_df['Date'], format='%d/%m/%y', errors='coerce')
-    clean_df = clean_df.dropna(subset=['Date', 'Amount']) 
-    
-    # ADD THIS LINE: Explicitly tag this data as coming from the Bank
+    clean_df = clean_df.dropna(subset=['Date', 'Amount'])
+
+    # Explicitly tag this data as coming from the Bank
     clean_df['Account_Source'] = 'HDFC Bank'
-    
+
     return clean_df
+
 
 def standardize_splitwise_data(df, user_name="Rishabh Agrawal"):
     """
@@ -416,6 +420,12 @@ def standardize_splitwise_data(df, user_name="Rishabh Agrawal"):
       - Your real personal share of an expense -> 'your_share' / 'Amount'
     Settlements ("Payment" rows) are never a real expense (bug #2 fix) -- they're
     just cash moving between people and must not inflate category spend.
+
+    This same row shape (Date, Description, Category, Cost, Currency, plus
+    one column per group member holding their net balance for that expense)
+    is what both a Splitwise CSV "detailed" export produces AND what
+    splitwise_api.expenses_to_dataframe() builds from the live API -- so
+    this function doesn't care which source `df` came from.
     """
     if user_name not in df.columns:
         raise ValueError(f"User '{user_name}' not found in Splitwise columns. Please check your exact Splitwise display name.")
@@ -502,3 +512,75 @@ def finalize_splitwise_category(df, fallback_category="Uncategorized"):
         .fillna(fallback_category)
     )
     return df.drop(columns=['_settlement_category', '_category_hint'])
+
+
+# --- Manual entry ------------------------------------------------------------
+# Backdated cash spends, or anything with no statement/export to upload at
+# all, need a way in that doesn't go through the standardize_* pipeline.
+# A manual entry skips narration cleanup and header-detection entirely --
+# the user is typing an already-readable description -- but still flows
+# through the exact same apply_category_rules -> merge_and_dedup ->
+# run_global_reconciliation -> save pipeline as every other source, so it
+# benefits from learned category rules and safe re-entry deduplication.
+MANUAL_ENTRY_ACCOUNT_SOURCE = "Manual Entry"
+
+
+def create_manual_entry_row(date, description, amount, txn_type, category="Uncategorized",
+                             account_source=MANUAL_ENTRY_ACCOUNT_SOURCE):
+    """
+    Build a single standardized transaction row for a manually entered
+    transaction (typically a backdated cash expense, or anything with no
+    statement/CSV to upload).
+
+    Input:
+        date: str or datetime-like -- the transaction date.
+        description (str): free-text description. Cannot be blank.
+        amount (float): must be a positive number.
+        txn_type (str): 'Debit' or 'Credit'.
+        category (str, optional): defaults to 'Uncategorized' so it still
+            gets a chance to pick up a learned category rule via
+            apply_category_rules() during the normal upload pipeline.
+        account_source (str, optional): defaults to MANUAL_ENTRY_ACCOUNT_
+            SOURCE ('Manual Entry') so these rows are visibly
+            distinguishable in the Triage queue / Analysis, and are
+            automatically excluded from BANK_SOURCES in engine.py -- they
+            can never accidentally be treated as a bank leg, and (being
+            outside BANK_SOURCES) they're technically eligible to be
+            reconciled as an "external ledger" too, though in practice a
+            manual entry has no you_paid/you_received amount set, so
+            run_global_reconciliation has nothing to match for it.
+
+    Output:
+        pd.DataFrame with exactly one row, in the same column shape the
+        other standardize_* functions produce (Date, Description, Amount,
+        Type, Account_Source, Category) -- ready to be lower-cased and fed
+        into merge_and_dedup exactly like any file-derived DataFrame.
+
+    Edge cases:
+        - Raises ValueError if description is blank, amount is missing or
+          not strictly positive, or txn_type isn't 'Debit'/'Credit' -- a
+          zero/blank manual entry is never meaningful (mirrors the
+          net == 0 filtering already done for Splitwise rows).
+        - Does NOT run clean_bank_narration() on the description, since
+          there's no UPI/IMPS boilerplate to strip from user-typed text.
+    """
+    description = str(description or "").strip()
+    if not description:
+        raise ValueError("Description cannot be blank for a manual entry.")
+    if amount is None or amount <= 0:
+        raise ValueError("Amount must be a positive number for a manual entry.")
+    if txn_type not in ("Debit", "Credit"):
+        raise ValueError("txn_type must be 'Debit' or 'Credit'.")
+
+    parsed_date = pd.to_datetime(date, errors='coerce')
+    if pd.isna(parsed_date):
+        raise ValueError(f"Could not parse manual entry date: {date!r}")
+
+    return pd.DataFrame([{
+        "Date": parsed_date,
+        "Description": description,
+        "Amount": float(amount),
+        "Type": txn_type,
+        "Account_Source": account_source,
+        "Category": category or "Uncategorized",
+    }])
